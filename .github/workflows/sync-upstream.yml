@@ -1,0 +1,86 @@
+name: Sync upstream
+
+# Keeps this fork's main branch current with heygen-com/hyperframes.
+# Runs daily and on demand. Merges upstream/main into main (merge commit, never
+# a force-push), so fork-only files such as this workflow survive every sync.
+#
+# Token: set the repository secret UPSTREAM_SYNC_TOKEN to a fine-grained PAT
+# scoped to this repo with Contents: read/write and Workflows: read/write.
+# The default GITHUB_TOKEN cannot push commits that touch .github/workflows/,
+# and upstream changes those files often, so without the PAT most syncs fail.
+# On a merge conflict the job fails and opens (or comments on) a tracking issue.
+
+on:
+  schedule:
+    - cron: "17 2 * * *" # 02:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository != 'heygen-com/hyperframes'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UPSTREAM_REPO: heygen-com/hyperframes
+      BRANCH: main
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          lfs: false
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "$BRANCH"
+
+          if git merge-base --is-ancestor "upstream/$BRANCH" HEAD; then
+            echo "Already up to date with ${UPSTREAM_REPO}@$(git rev-parse --short "upstream/$BRANCH")."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge --no-edit "upstream/$BRANCH" \
+              -m "chore: sync with ${UPSTREAM_REPO}@$(git rev-parse --short "upstream/$BRANCH")"; then
+            git diff --name-only --diff-filter=U | sed 's/^/- /' > conflicts.txt
+            git merge --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Push
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin "HEAD:$BRANCH"
+
+      - name: Report conflict
+        if: failure() && steps.merge.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Upstream sync blocked by merge conflict"
+          body="$(printf 'Merging %s/%s into %s conflicts in:\n\n%s\n\nResolve locally (git fetch upstream && git merge upstream/%s), push, then re-run the Sync upstream workflow.\n\nRun: %s/%s/actions/runs/%s' \
+            "$UPSTREAM_REPO" "$BRANCH" "$BRANCH" "$(cat conflicts.txt)" "$BRANCH" \
+            "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID")"
+          existing="$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number' 2>/dev/null || true)"
+          echo "::error::$title"
+          printf '%s\n' "$body" >> "$GITHUB_STEP_SUMMARY"
+          # Forks ship with Issues disabled; the run summary above still carries the report.
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body" || true
+          else
+            gh issue create --title "$title" --body "$body" || true
+          fi
